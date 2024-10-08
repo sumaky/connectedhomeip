@@ -576,7 +576,7 @@ NSDictionary<NSString *, id> * _Nullable MTRDecodeDataValueDictionaryFromCHIPTLV
     }
 }
 
-static CHIP_ERROR MTREncodeTLVFromDataValueDictionary(id object, chip::TLV::TLVWriter & writer, chip::TLV::Tag tag)
+static CHIP_ERROR MTREncodeTLVFromDataValueDictionaryInternal(id object, chip::TLV::TLVWriter & writer, chip::TLV::Tag tag)
 {
     if (![object isKindOfClass:[NSDictionary class]]) {
         MTR_LOG_ERROR("Error: Unsupported object to encode: %@", [object class]);
@@ -585,7 +585,7 @@ static CHIP_ERROR MTREncodeTLVFromDataValueDictionary(id object, chip::TLV::TLVW
     NSString * typeName = ((NSDictionary *) object)[MTRTypeKey];
     id value = ((NSDictionary *) object)[MTRValueKey];
     if (![typeName isKindOfClass:[NSString class]]) {
-        MTR_LOG_ERROR("Error: Object to encode is corrupt");
+        MTR_LOG_ERROR("Error: Object to encode has no MTRTypeKey: %@", object);
         return CHIP_ERROR_INVALID_ARGUMENT;
     }
 
@@ -632,14 +632,14 @@ static CHIP_ERROR MTREncodeTLVFromDataValueDictionary(id object, chip::TLV::TLVW
             MTR_LOG_ERROR("Error: Object to encode has corrupt UTF8 string type: %@", [value class]);
             return CHIP_ERROR_INVALID_ARGUMENT;
         }
-        return writer.PutString(tag, [value UTF8String]);
+        return writer.PutString(tag, AsCharSpan(value));
     }
     if ([typeName isEqualToString:MTROctetStringValueType]) {
         if (![value isKindOfClass:[NSData class]]) {
             MTR_LOG_ERROR("Error: Object to encode has corrupt octet string type: %@", [value class]);
             return CHIP_ERROR_INVALID_ARGUMENT;
         }
-        return writer.Put(tag, chip::ByteSpan(static_cast<const uint8_t *>([value bytes]), [value length]));
+        return writer.Put(tag, AsByteSpan(value));
     }
     if ([typeName isEqualToString:MTRStructureValueType]) {
         if (![value isKindOfClass:[NSArray class]]) {
@@ -674,7 +674,7 @@ static CHIP_ERROR MTREncodeTLVFromDataValueDictionary(id object, chip::TLV::TLVW
                 tag = TLV::ContextTag(static_cast<uint8_t>(tagValue));
             }
             ReturnErrorOnFailure(
-                MTREncodeTLVFromDataValueDictionary(elementValue, writer, tag));
+                MTREncodeTLVFromDataValueDictionaryInternal(elementValue, writer, tag));
         }
         ReturnErrorOnFailure(writer.EndContainer(outer));
         return CHIP_NO_ERROR;
@@ -696,13 +696,22 @@ static CHIP_ERROR MTREncodeTLVFromDataValueDictionary(id object, chip::TLV::TLVW
                 MTR_LOG_ERROR("Error: Array element to encode has corrupt value: %@", element);
                 return CHIP_ERROR_INVALID_ARGUMENT;
             }
-            ReturnErrorOnFailure(MTREncodeTLVFromDataValueDictionary(elementValue, writer, chip::TLV::AnonymousTag()));
+            ReturnErrorOnFailure(MTREncodeTLVFromDataValueDictionaryInternal(elementValue, writer, chip::TLV::AnonymousTag()));
         }
         ReturnErrorOnFailure(writer.EndContainer(outer));
         return CHIP_NO_ERROR;
     }
     MTR_LOG_ERROR("Error: Unsupported type to encode: %@", typeName);
     return CHIP_ERROR_INVALID_ARGUMENT;
+}
+
+static CHIP_ERROR MTREncodeTLVFromDataValueDictionary(id object, chip::TLV::TLVWriter & writer, chip::TLV::Tag tag)
+{
+    CHIP_ERROR err = MTREncodeTLVFromDataValueDictionaryInternal(object, writer, tag);
+    if (err != CHIP_NO_ERROR) {
+        MTR_LOG_ERROR("Failed to encode to TLV: %@", object);
+    }
+    return err;
 }
 
 NSData * _Nullable MTREncodeTLVFromDataValueDictionary(NSDictionary<NSString *, id> * value, NSError * __autoreleasing * error)
@@ -991,6 +1000,8 @@ private:
                      queue:(dispatch_queue_t)queue
                 completion:(MTRDeviceResponseHandler)completion
 {
+    MTR_LOG("%@ readAttributePaths: %@, eventPaths: %@", self, attributePaths, eventPaths);
+
     [self readAttributePaths:attributePaths eventPaths:eventPaths params:params includeDataVersion:NO queue:queue completion:completion];
 }
 
@@ -1001,6 +1012,9 @@ private:
                      queue:(dispatch_queue_t)queue
                 completion:(MTRDeviceResponseHandler)completion
 {
+    // NOTE: Do not log the read here.  This is called ether from
+    // readAttributePaths:eventPaths:params:queue:completion: or MTRDevice, both
+    // of which already log, and we want to be able to tell the two codepaths apart.
     if ((attributePaths == nil || [attributePaths count] == 0) && (eventPaths == nil || [eventPaths count] == 0)) {
         // No paths, just return an empty array.
         dispatch_async(queue, ^{
@@ -1157,6 +1171,19 @@ private:
                    timedWriteTimeout:(NSNumber * _Nullable)timeoutMs
                                queue:(dispatch_queue_t)queue
                           completion:(MTRDeviceResponseHandler)completion
+{
+    MTR_LOG("%@ write %@ 0x%llx 0x%llx: %@", self, endpointID, clusterID.unsignedLongLongValue, attributeID.unsignedLongLongValue, value);
+
+    [self _writeAttributeWithEndpointID:endpointID clusterID:clusterID attributeID:attributeID value:value timedWriteTimeout:timeoutMs queue:queue completion:completion];
+}
+
+- (void)_writeAttributeWithEndpointID:(NSNumber *)endpointID
+                            clusterID:(NSNumber *)clusterID
+                          attributeID:(NSNumber *)attributeID
+                                value:(id)value
+                    timedWriteTimeout:(NSNumber * _Nullable)timeoutMs
+                                queue:(dispatch_queue_t)queue
+                           completion:(MTRDeviceResponseHandler)completion
 {
     auto * bridge = new MTRDataValueDictionaryCallbackBridge(queue, completion,
         ^(ExchangeManager & exchangeManager, const SessionHandle & session, MTRDataValueDictionaryCallback successCb,
@@ -1337,6 +1364,7 @@ exit:
                          commandFields:commandFields
                     timedInvokeTimeout:timeoutMs
            serverSideProcessingTimeout:nil
+                               logCall:YES
                                  queue:queue
                             completion:completion];
 }
@@ -1347,6 +1375,7 @@ exit:
                        commandFields:(id)commandFields
                   timedInvokeTimeout:(NSNumber * _Nullable)timeoutMs
          serverSideProcessingTimeout:(NSNumber * _Nullable)serverSideProcessingTimeout
+                             logCall:(BOOL)logCall
                                queue:(dispatch_queue_t)queue
                           completion:(MTRDeviceResponseHandler)completion
 {
@@ -1365,6 +1394,10 @@ exit:
     timeoutMs = [timeoutMs copy];
     if (timeoutMs != nil) {
         timeoutMs = MTRClampedNumber(timeoutMs, @(1), @(UINT16_MAX));
+    }
+
+    if (logCall) {
+        MTR_LOG("%@ invoke %@ 0x%llx 0x%llx: %@", self, endpointID, clusterID.unsignedLongLongValue, commandID.unsignedLongLongValue, commandFields);
     }
 
     auto * bridge = new MTRDataValueDictionaryCallbackBridge(queue, completion,
@@ -1490,6 +1523,7 @@ exit:
                          commandFields:commandFields
                     timedInvokeTimeout:timeout
            serverSideProcessingTimeout:serverSideProcessingTimeout
+                               logCall:YES
                                  queue:queue
                             completion:responseHandler];
 }
@@ -2148,6 +2182,12 @@ MTREventPriority MTREventPriorityForValidPriorityLevel(chip::app::PriorityLevel 
                                       completion:completion];
 }
 
+- (NSString *)description
+{
+    return [NSString
+        stringWithFormat:@"<%@: %p, node: %016llX-%016llX (%llu)>", NSStringFromClass(self.class), self, _deviceController.compressedFabricID.unsignedLongLongValue, _nodeID, _nodeID];
+}
+
 @end
 
 @implementation MTRBaseDevice (Deprecated)
@@ -2262,6 +2302,45 @@ MTREventPriority MTREventPriorityForValidPriorityLevel(chip::app::PriorityLevel 
 
 @end
 
+static NSString * FormatPossiblyWildcardEndpoint(NSNumber * _Nullable possiblyWildcardEndpoint)
+{
+    if (possiblyWildcardEndpoint == nil) {
+        return @"wildcard";
+    }
+
+    return [NSString stringWithFormat:@"%u", possiblyWildcardEndpoint.unsignedShortValue];
+}
+
+static NSString * FormatPossiblyWildcardCluster(NSNumber * _Nullable possiblyWildcardCluster)
+{
+    if (possiblyWildcardCluster == nil) {
+        return @"wildcard";
+    }
+
+    return [NSString stringWithFormat:@"0x%llx (%llu, %@)",
+                     possiblyWildcardCluster.unsignedLongLongValue,
+                     possiblyWildcardCluster.unsignedLongLongValue,
+                     MTRClusterNameForID(static_cast<MTRClusterIDType>(possiblyWildcardCluster.unsignedLongLongValue))];
+}
+
+static NSString * FormatPossiblyWildcardClusterElement(NSNumber * _Nullable possiblyWildcardCluster, NSNumber * _Nullable possiblyWildcardElement, NSString * (^nameGetter)(MTRClusterIDType clusterID, NSNumber * elementID))
+{
+    if (possiblyWildcardElement == nil) {
+        return @"wildcard";
+    }
+
+    if (possiblyWildcardCluster == nil) {
+        // We can't get a useful name for this, so just return the numeric
+        // value.
+        return [NSString stringWithFormat:@"0x%llx (%llu)", possiblyWildcardElement.unsignedLongLongValue, possiblyWildcardElement.unsignedLongLongValue];
+    }
+
+    return [NSString stringWithFormat:@"0x%llx (%llu, %@)",
+                     possiblyWildcardElement.unsignedLongLongValue,
+                     possiblyWildcardElement.unsignedLongLongValue,
+                     nameGetter(static_cast<MTRClusterIDType>(possiblyWildcardCluster.unsignedLongLongValue), possiblyWildcardElement)];
+}
+
 @implementation MTRAttributeRequestPath
 - (instancetype)initWithEndpointID:(NSNumber * _Nullable)endpointID
                          clusterID:(NSNumber * _Nullable)clusterID
@@ -2275,9 +2354,12 @@ MTREventPriority MTREventPriorityForValidPriorityLevel(chip::app::PriorityLevel 
 
 - (NSString *)description
 {
-    return [NSString stringWithFormat:@"<MTRAttributeRequestPath endpoint %u cluster %u attribute %u>",
-                     (uint16_t) _endpoint.unsignedShortValue, (uint32_t) _cluster.unsignedLongValue,
-                     (uint32_t) _attribute.unsignedLongValue];
+    NSString * endpointStr = FormatPossiblyWildcardEndpoint(_endpoint);
+    NSString * clusterStr = FormatPossiblyWildcardCluster(_cluster);
+    NSString * attributeStr = FormatPossiblyWildcardClusterElement(_cluster, _attribute, ^(MTRClusterIDType clusterID, NSNumber * attributeID) {
+        return MTRAttributeNameForID(clusterID, static_cast<MTRAttributeIDType>(attributeID.unsignedLongLongValue));
+    });
+    return [NSString stringWithFormat:@"<MTRAttributeRequestPath endpoint %@ cluster %@ attribute %@>", endpointStr, clusterStr, attributeStr];
 }
 
 + (MTRAttributeRequestPath *)requestPathWithEndpointID:(NSNumber * _Nullable)endpointID
@@ -2333,6 +2415,57 @@ MTREventPriority MTREventPriorityForValidPriorityLevel(chip::app::PriorityLevel 
         params.SetWildcardAttributeId();
     }
 }
+
+static NSString * const sEndpointIDKey = @"endpointIDKey";
+static NSString * const sClusterIDKey = @"clusterIDKey";
+static NSString * const sAttributeIDKey = @"attributeIDKey";
+
++ (BOOL)supportsSecureCoding
+{
+    return YES;
+}
+
+- (nullable instancetype)initWithCoder:(NSCoder *)decoder
+{
+    self = [super init];
+    if (self == nil) {
+        return nil;
+    }
+
+    _endpoint = [decoder decodeObjectOfClass:[NSNumber class] forKey:sEndpointIDKey];
+    if (_endpoint && ![_endpoint isKindOfClass:[NSNumber class]]) {
+        MTR_LOG_ERROR("MTRAttributeRequestPath decoded %@ for endpoint, not NSNumber.", _attribute);
+        return nil;
+    }
+
+    _cluster = [decoder decodeObjectOfClass:[NSNumber class] forKey:sClusterIDKey];
+    if (_cluster && ![_cluster isKindOfClass:[NSNumber class]]) {
+        MTR_LOG_ERROR("MTRAttributeRequestPath decoded %@ for cluster, not NSNumber.", _attribute);
+        return nil;
+    }
+
+    _attribute = [decoder decodeObjectOfClass:[NSNumber class] forKey:sAttributeIDKey];
+    if (_attribute && ![_attribute isKindOfClass:[NSNumber class]]) {
+        MTR_LOG_ERROR("MTRAttributeRequestPath decoded %@ for attribute, not NSNumber.", _attribute);
+        return nil;
+    }
+
+    return self;
+}
+
+- (void)encodeWithCoder:(NSCoder *)coder
+{
+    if (_endpoint) {
+        [coder encodeObject:_endpoint forKey:sEndpointIDKey];
+    }
+    if (_cluster) {
+        [coder encodeObject:_cluster forKey:sClusterIDKey];
+    }
+    if (_attribute) {
+        [coder encodeObject:_attribute forKey:sAttributeIDKey];
+    }
+}
+
 @end
 
 @implementation MTREventRequestPath
@@ -2348,9 +2481,12 @@ MTREventPriority MTREventPriorityForValidPriorityLevel(chip::app::PriorityLevel 
 
 - (NSString *)description
 {
-    return [NSString stringWithFormat:@"<MTREventRequestPath endpoint %u cluster %u event %u>",
-                     (uint16_t) _endpoint.unsignedShortValue, (uint32_t) _cluster.unsignedLongValue,
-                     (uint32_t) _event.unsignedLongValue];
+    NSString * endpointStr = FormatPossiblyWildcardEndpoint(_endpoint);
+    NSString * clusterStr = FormatPossiblyWildcardCluster(_cluster);
+    NSString * eventStr = FormatPossiblyWildcardClusterElement(_cluster, _event, ^(MTRClusterIDType clusterID, NSNumber * eventID) {
+        return MTREventNameForID(clusterID, static_cast<MTREventIDType>(eventID.unsignedLongLongValue));
+    });
+    return [NSString stringWithFormat:@"<MTREventRequestPath endpoint %@ cluster %@ event %@>", endpointStr, clusterStr, eventStr];
 }
 
 + (MTREventRequestPath *)requestPathWithEndpointID:(NSNumber * _Nullable)endpointID
@@ -2406,6 +2542,56 @@ MTREventPriority MTREventPriorityForValidPriorityLevel(chip::app::PriorityLevel 
         params.SetWildcardEventId();
     }
 }
+static NSString * const sEventEndpointIDKey = @"endpointIDKey";
+static NSString * const sEventClusterIDKey = @"clusterIDKey";
+static NSString * const sEventAttributeIDKey = @"attributeIDKey";
+
++ (BOOL)supportsSecureCoding
+{
+    return YES;
+}
+
+- (nullable instancetype)initWithCoder:(NSCoder *)decoder
+{
+    self = [super init];
+    if (self == nil) {
+        return nil;
+    }
+
+    _endpoint = [decoder decodeObjectOfClass:[NSNumber class] forKey:sEventEndpointIDKey];
+    if (_endpoint && ![_endpoint isKindOfClass:[NSNumber class]]) {
+        MTR_LOG_ERROR("MTREventRequestPath decoded %@ for endpoint, not NSNumber.", _endpoint);
+        return nil;
+    }
+
+    _cluster = [decoder decodeObjectOfClass:[NSNumber class] forKey:sEventClusterIDKey];
+    if (_cluster && ![_cluster isKindOfClass:[NSNumber class]]) {
+        MTR_LOG_ERROR("MTREventRequestPath decoded %@ for cluster, not NSNumber.", _cluster);
+        return nil;
+    }
+
+    _event = [decoder decodeObjectOfClass:[NSNumber class] forKey:sEventAttributeIDKey];
+    if (_event && ![_event isKindOfClass:[NSNumber class]]) {
+        MTR_LOG_ERROR("MTREventRequestPath decoded %@ for event, not NSNumber.", _event);
+        return nil;
+    }
+
+    return self;
+}
+
+- (void)encodeWithCoder:(NSCoder *)coder
+{
+    if (_endpoint) {
+        [coder encodeObject:_endpoint forKey:sEventEndpointIDKey];
+    }
+    if (_cluster) {
+        [coder encodeObject:_cluster forKey:sEventClusterIDKey];
+    }
+    if (_event) {
+        [coder encodeObject:_event forKey:sEventAttributeIDKey];
+    }
+}
+
 @end
 
 @implementation MTRClusterPath
@@ -2420,8 +2606,9 @@ MTREventPriority MTREventPriorityForValidPriorityLevel(chip::app::PriorityLevel 
 
 - (NSString *)description
 {
-    return [NSString stringWithFormat:@"<MTRClusterPath endpoint %u cluster %u>", (uint16_t) _endpoint.unsignedShortValue,
-                     (uint32_t) _cluster.unsignedLongValue];
+    return [NSString stringWithFormat:@"<MTRClusterPath endpoint %u cluster 0x%llx (%llu, %@)>", _endpoint.unsignedShortValue,
+                     _cluster.unsignedLongLongValue, _cluster.unsignedLongLongValue,
+                     MTRClusterNameForID(static_cast<MTRClusterIDType>(_cluster.unsignedLongLongValue))];
 }
 
 + (MTRClusterPath *)clusterPathWithEndpointID:(NSNumber *)endpointID clusterID:(NSNumber *)clusterID
@@ -2505,9 +2692,11 @@ static NSString * const sClusterKey = @"clusterKey";
 
 - (NSString *)description
 {
-    return [NSString stringWithFormat:@"<MTRAttributePath endpoint %u cluster %u attribute %u>",
-                     (uint16_t) self.endpoint.unsignedShortValue, (uint32_t) self.cluster.unsignedLongValue,
-                     (uint32_t) _attribute.unsignedLongValue];
+    return [NSString stringWithFormat:@"<MTRAttributePath endpoint %u cluster 0x%llx (%llu, %@) 0x%llx (%llu, %@)>",
+                     self.endpoint.unsignedShortValue,
+                     self.cluster.unsignedLongLongValue, self.cluster.unsignedLongLongValue, MTRClusterNameForID(static_cast<MTRClusterIDType>(self.cluster.unsignedLongLongValue)),
+                     _attribute.unsignedLongLongValue, _attribute.unsignedLongLongValue,
+                     MTRAttributeNameForID(static_cast<MTRClusterIDType>(self.cluster.unsignedLongLongValue), static_cast<MTRAttributeIDType>(_attribute.unsignedLongLongValue))];
 }
 
 + (MTRAttributePath *)attributePathWithEndpointID:(NSNumber *)endpointID
@@ -2602,8 +2791,11 @@ static NSString * const sAttributeKey = @"attributeKey";
 - (NSString *)description
 {
     return
-        [NSString stringWithFormat:@"<MTREventPath endpoint %u cluster %u event %u>", (uint16_t) self.endpoint.unsignedShortValue,
-                  (uint32_t) self.cluster.unsignedLongValue, (uint32_t) _event.unsignedLongValue];
+        [NSString stringWithFormat:@"<MTREventPath endpoint %u cluster 0x%llx (%llu, %@) event 0x%llx (%llu, %@)>",
+                  self.endpoint.unsignedShortValue,
+                  self.cluster.unsignedLongLongValue, self.cluster.unsignedLongLongValue, MTRClusterNameForID(static_cast<MTRClusterIDType>(self.cluster.unsignedLongLongValue)),
+                  _event.unsignedLongLongValue, _event.unsignedLongLongValue,
+                  MTREventNameForID(static_cast<MTRClusterIDType>(self.cluster.unsignedLongLongValue), static_cast<MTREventIDType>(_event.unsignedLongLongValue))];
 }
 
 + (MTREventPath *)eventPathWithEndpointID:(NSNumber *)endpointID clusterID:(NSNumber *)clusterID eventID:(NSNumber *)eventID
@@ -2692,8 +2884,9 @@ static NSString * const sEventKey = @"eventKey";
 - (NSString *)description
 {
     return
-        [NSString stringWithFormat:@"<MTRCommandPath endpoint %u cluster %lu command %lu>", self.endpoint.unsignedShortValue,
-                  self.cluster.unsignedLongValue, _command.unsignedLongValue];
+        [NSString stringWithFormat:@"<MTRCommandPath endpoint %u cluster 0x%llx (%llu) command 0x%llx (%llu)>", self.endpoint.unsignedShortValue,
+                  self.cluster.unsignedLongLongValue, self.cluster.unsignedLongLongValue, _command.unsignedLongLongValue,
+                  _command.unsignedLongLongValue];
 }
 
 + (MTRCommandPath *)commandPathWithEndpointID:(NSNumber *)endpointID clusterID:(NSNumber *)clusterID commandID:(NSNumber *)commandID
